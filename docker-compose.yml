@@ -1,0 +1,141 @@
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: oil_postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-oiluser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-oilpass}
+      POSTGRES_DB: ${POSTGRES_DB:-oildb}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-oiluser} -d ${POSTGRES_DB:-oildb}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  minio:
+    image: minio/minio:latest
+    container_name: oil_minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_started
+    entrypoint: >
+      /bin/sh -c "
+      sleep 3;
+      mc alias set local http://minio:9000 $${MINIO_ROOT_USER} $${MINIO_ROOT_PASSWORD};
+      mc mb -p local/oil-raw || true;
+      mc mb -p local/oil-processed || true;
+      mc mb -p local/oil-marts || true;
+      exit 0;
+      "
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+
+  jupyterhub:
+    image: jupyter/datascience-notebook:latest
+    container_name: oil_jupyter
+    user: root
+    ports:
+      - "8888:8888"
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: ${POSTGRES_USER:-oiluser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-oilpass}
+      POSTGRES_DB: ${POSTGRES_DB:-oildb}
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      JUPYTER_TOKEN: ${JUPYTER_TOKEN:-oilhomework}
+      CHOWN_HOME: "yes"
+      CHOWN_EXTRA: /home/jovyan/work
+    command:
+      - bash
+      - -lc
+      - |
+        pip install -q boto3 pyarrow fastparquet psycopg2-binary minio python-dotenv
+        exec start-notebook.sh --NotebookApp.token="$${JUPYTER_TOKEN}"
+    volumes:
+      - ./notebooks:/home/jovyan/work/notebooks
+      - ./etl:/home/jovyan/work/etl
+      - ./data:/home/jovyan/work/data:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_started
+
+  superset:
+    image: apache/superset:4.0.2
+    container_name: oil_superset
+    user: root
+    ports:
+      - "8088:8088"
+    environment:
+      SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY:-oil_superset_secret_key_change_me}
+      SUPERSET_CONFIG_PATH: /app/pythonpath/superset_config.py
+      POSTGRES_USER: ${POSTGRES_USER:-oiluser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-oilpass}
+      POSTGRES_DB: ${POSTGRES_DB:-oildb}
+    volumes:
+      - superset_data:/app/superset_home
+      - ./superset/superset_config.py:/app/pythonpath/superset_config.py:ro
+      - ./superset/superset_init.sh:/app/superset_init.sh:ro
+    command:
+      - bash
+      - /app/superset_init.sh
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  etl:
+    image: python:3.11-slim
+    container_name: oil_etl
+    working_dir: /app
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: ${POSTGRES_USER:-oiluser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-oilpass}
+      POSTGRES_DB: ${POSTGRES_DB:-oildb}
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    volumes:
+      - ./etl:/app
+    command:
+      - bash
+      - -lc
+      - |
+        pip install -q pandas pyarrow boto3 sqlalchemy psycopg2-binary scikit-learn joblib python-dotenv
+        python export_to_minio.py
+        python build_marts.py
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    profiles:
+      - etl
+
+volumes:
+  postgres_data:
+  minio_data:
+  superset_data:
